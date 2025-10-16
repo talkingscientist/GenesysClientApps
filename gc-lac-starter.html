@@ -1,0 +1,337 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GC LAC Starter — Load • Auth • Cache (Implicit, Browser)</title>
+</head>
+<body>
+  <h1>GC LAC Starter</h1>
+  <p>Check console for authentication status</p>
+
+  <script>
+  /*
+   * TALKINGSCIENTIST — GC LAC Starter (Load-Auth-Cache, Browser Implicit)
+   * Owner: TalkingScientist. If it breaks, I fix it. If it works, you buy coffee.
+   *
+   * What this is:
+   *   A tiny, browser-only starter that gets you an OAuth access token for the
+   *   Genesys Cloud Platform API using Implicit Grant and the JavaScript SDK.
+   *   Zero build tools. No frameworks. Paste, host, go.
+   *
+   * What you need BEFORE LAC will work:
+   *   Create an OAuth client in Genesys Cloud (admin UI):
+   *     Admin ? IT and Integrations ? OAuth ? Add a client
+   *       Grant Type:  Token Implicit Grant (Browser)
+   *       Authorized redirect URIs:  EXACT URL of THIS page
+   *         e.g., https://www.talkingscientist.com/example/gc-lac-starter.html
+   *       Scope:  Only what you need (least privilege).
+   *         Example: analytics conversations notifications presence routing:readonly users:readonly
+   *       Save. Copy the Client ID. Store the Client Secret securely
+   *       (Implicit does not use the secret in the browser; never ship it).
+   *   Docs:
+   *     Create an OAuth client — https://help.mypurecloud.com/articles/create-an-oauth-client/
+   *     Implicit Grant overview — https://developer.genesys.cloud/authorization/platform-auth/guides/oauth/module-2-implicit-grant
+   *     Scopes explained — https://help.mypurecloud.com/articles/about-oauth-scopes-for-applications/
+   *
+   * URL parameters LAC understands:
+   *   clientId : (required) Your OAuth Client ID from Admin ? OAuth.
+   *   env      : (required) Genesys Cloud region base domain, NO scheme, NO “apps.”, NO “login.”
+   *              Examples: usw2.pure.cloud | mypurecloud.com | mypurecloud.ie | apne2.pure.cloud
+   *              Region reference: https://help.mypurecloud.com/articles/required-genesys-cloud-domains/
+   *   debug    : (optional) "true" for chatty logs that future-you will appreciate.
+   *
+   * Quick start example URL:
+   *   ?clientId=abc123&env=usw2.pure.cloud&debug=true
+   *
+   * Security footnotes (because production has feelings):
+   *   • This uses OAuth Implicit Grant. Great for POCs and simple browser apps.
+   *     For production web apps, prefer Authorization Code (+ PKCE) if possible:
+   *       https://developer.genesys.cloud/authorization/platform-auth/guides/oauth-auth-code-guide
+   *   • Tokens live in localStorage and memory here. Keep this page on trusted origins.
+   *   • Pin your SDK version (avoid “latest”) to reduce surprise upgrades:
+   *       https://sdk-cdn.mypurecloud.com/javascript/<version>/purecloud-platform-client-v2.min.js
+   *   • Scope hygiene saves lives. Grant read-only when possible. Audit regularly.
+   */
+
+  (async () => {
+    // DEBUG SWITCH: add &debug=true to the URL for running commentary; otherwise LAC stays politely quiet.
+    const urlSearchParams = new URLSearchParams(window.location.search);
+    const DEBUG = urlSearchParams.get('debug') === 'true';
+
+    function log(...args) {
+      if (DEBUG) {
+        console.log(...args);
+      }
+    }
+
+    log('=== TalkingScientist: LAC boot ===');
+
+    // SDK LOADER: If the Platform SDK is already present, use it. If not, pull it from the official CDN.
+    async function loadSdk() {
+      let platformClient = window.platformClient || window.purecloudPlatformClientV2 ||
+                          (window.purecloud && window.purecloud.platformClient);
+
+      if (platformClient) {
+        log('? SDK present (global)');
+        return platformClient;
+      }
+
+      // Load from CDN. For production, pin a specific version instead of "latest".
+      // SDK repo/docs: https://github.com/MyPureCloud/platform-client-sdk-javascript
+      log('?? Fetching Genesys Cloud SDK from CDN...');
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://sdk-cdn.mypurecloud.com/javascript/latest/purecloud-platform-client-v2.min.js';
+        // Tip: use /javascript/<version>/purecloud-platform-client-v2.min.js to pin.
+        script.async = false;
+        script.onload = resolve;
+        script.onerror = (err) => {
+          console.error('? SDK script failed to load:', err);
+          reject(err);
+        };
+        document.head.appendChild(script);
+      });
+
+      // Some AMD stacks expose it via require().
+      try {
+        if (typeof window.require === 'function') {
+          platformClient = window.require('platformClient');
+          if (platformClient) {
+            log('? SDK resolved via AMD/RequireJS');
+            return platformClient;
+          }
+        }
+      } catch {
+        // If require() isn’t our friend today, we keep going.
+      }
+
+      // Poll for the SDK to appear on window (script timing can be slippery).
+      for (let i = 0; i < 50; i++) {
+        platformClient = window.platformClient || window.purecloudPlatformClientV2 ||
+                        (window.purecloud && window.purecloud.platformClient);
+        if (platformClient) {
+          log('? SDK available (window)');
+          return platformClient;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Heuristic fallback: find an object that quacks like the SDK.
+      for (const key in window) {
+        try {
+          const obj = window[key];
+          if (obj && typeof obj === 'object' && obj.ApiClient && obj.UsersApi) {
+            log('? SDK found (heuristic)');
+            return obj;
+          }
+        } catch {
+          // Some window props are booby-trapped. We move on.
+        }
+      }
+
+      return null;
+    }
+
+    const platformClient = await loadSdk();
+    if (!platformClient) {
+      console.error('? Could not load Genesys Cloud SDK. Check CDN reachability and your CSP.');
+      return;
+    }
+
+    const client = platformClient.ApiClient.instance;
+
+    // URL MERGE: OAuth redirects use #fragment; humans use ?query. LAC accepts both; query wins.
+    function getAllUrlParams() {
+      const params = {};
+      const urlParams = new URLSearchParams(window.location.search);
+
+      const hash = window.location.hash && window.location.hash.startsWith('#')
+        ? window.location.hash.substring(1)
+        : '';
+      if (hash) {
+        const hashParams = new URLSearchParams(hash);
+        hashParams.forEach((value, key) => {
+          params[key] = value;
+        });
+      }
+
+      urlParams.forEach((value, key) => {
+        params[key] = value;
+      });
+
+      return params;
+    }
+
+    // TOKEN CHECKER: Validate stored token. JWTs get decoded; opaque tokens rely on our stored expiry.
+    // Token lifetimes are governed by your OAuth client config. See: https://help.mypurecloud.com/articles/create-an-oauth-client/
+    function isTokenValid(token, skipExpiryCheck = false) {
+      if (!token) return false;
+
+      if (skipExpiryCheck) {
+        log('? Token accepted (fresh from OAuth redirect)');
+        return true;
+      }
+
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 3) {
+          // Opaque token path.
+          const storedExpiry = localStorage.getItem('gc_token_expiry');
+          if (storedExpiry) {
+            const expiryTime = parseInt(storedExpiry);
+            const now = Date.now();
+            if (now >= expiryTime) {
+              console.warn(`? Token expired at ${new Date(expiryTime).toLocaleString()}`);
+              return false;
+            }
+            const minutesLeft = Math.floor((expiryTime - now) / 60000);
+            log(`? Token valid ~${minutesLeft} more minutes (opaque)`);
+            return true;
+          }
+          log('?? Non-JWT token without stored expiry — assuming valid (POC mode).');
+          return true;
+        }
+
+        // JWT path.
+        const payload = JSON.parse(atob(parts[1]));
+        const exp = payload.exp * 1000;
+        const now = Date.now();
+        if (now >= exp) {
+          const expiredDate = new Date(exp).toLocaleString();
+          console.warn(`? Token expired at ${expiredDate}`);
+          return false;
+        }
+        const minutesLeft = Math.floor((exp - now) / 60000);
+        log(`? Token valid ~${minutesLeft} more minutes (JWT)`);
+        return true;
+      } catch (e) {
+        console.error('? Token validation error:', e);
+        return false;
+      }
+    }
+
+    // PERSIST PARAMS: Keep non-sensitive params so you don’t retype them all day.
+    function saveParamsToStorage(params) {
+      const savedParams = [];
+      Object.keys(params).forEach(key => {
+        if (key !== 'access_token' && key !== 'expires_in' && key !== 'token_type' && key !== 'state') {
+          localStorage.setItem(`gc_param_${key}`, params[key]);
+          savedParams.push(key);
+        }
+      });
+      if (savedParams.length > 0) {
+        log(`?? Stored params: ${savedParams.join(', ')}`);
+      }
+    }
+
+    // RESURRECT PARAMS: Fetch anything we saved earlier.
+    function loadParamsFromStorage() {
+      const params = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key.startsWith('gc_param_')) {
+          const paramName = key.replace('gc_param_', '');
+          params[paramName] = localStorage.getItem(key);
+        }
+      }
+      return params;
+    }
+
+    // 1) SLURP URL PARAMS
+    const urlParams = getAllUrlParams();
+    log('?? URL parameters detected:', Object.keys(urlParams));
+
+    // 2) CACHE THEM
+    if (Object.keys(urlParams).length > 0) {
+      saveParamsToStorage(urlParams);
+    }
+
+    // 3) GET clientId + env (query ? storage). Both required. No vibes—only measurements.
+    let clientId = urlParams.clientId || localStorage.getItem('gc_param_clientId');
+    let env = urlParams.env || localStorage.getItem('gc_param_env');
+
+    if (!clientId) {
+      console.error('? Missing clientId. Add ?clientId=YOUR_CLIENT_ID&env=YOUR_ENV to the URL.');
+      if (DEBUG) console.log('?? Example: ?clientId=abc123&env=usw2.pure.cloud');
+      return;
+    }
+
+    if (!env) {
+      console.error('? Missing env. Add ?env=YOUR_ENV (base domain only, e.g., usw2.pure.cloud).');
+      if (DEBUG) {
+        console.log('?? Examples: usw2.pure.cloud | mypurecloud.com | mypurecloud.ie | apne2.pure.cloud');
+        console.log('?? Regions/domains: https://help.mypurecloud.com/articles/required-genesys-cloud-domains/');
+      }
+      return;
+    }
+
+    log(`?? clientId: ${clientId}`);
+    log(`?? environment: ${env} (no scheme, no apps./login.)`);
+
+    // 4) APPLY ENVIRONMENT: never hardcode. SDK derives API/login hosts from the base domain.
+    client.setEnvironment(env);
+
+    // 5) OAUTH REDIRECT HANDLING: If we returned with #access_token, capture and set it.
+    if (urlParams.access_token) {
+      log('?? Captured access token from OAuth redirect');
+      localStorage.setItem('gc_access_token', urlParams.access_token);
+
+      if (urlParams.expires_in) {
+        const expiryTime = Date.now() + (parseInt(urlParams.expires_in) * 1000);
+        localStorage.setItem('gc_token_expiry', expiryTime.toString());
+        const minutesValid = Math.floor(parseInt(urlParams.expires_in) / 60);
+        log(`?? Token lifetime: ~${minutesValid} minutes`);
+      }
+
+      client.setAccessToken(urlParams.access_token);
+      log('? Authentication complete. LAC ready.');
+      log('?? Prove it: call UsersApi.getUsersMe().');
+
+      // Pretty the URL (strip fragment).
+      window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+
+      // Expose the client for quick experiments (globals are a POC convenience, not a lifestyle).
+      window.gcClient = client;
+      window.gcPlatformClient = platformClient;
+      return;
+    }
+
+    // 6) TRY A STORED TOKEN
+    let accessToken = localStorage.getItem('gc_access_token');
+
+    // 7) VALIDATE IT
+    if (accessToken) {
+      if (isTokenValid(accessToken)) {
+        log('?? Reusing valid token from storage');
+        client.setAccessToken(accessToken);
+        log('? Auth ready; no login round-trip required.');
+        log('?? Client available on window.gcClient');
+
+        window.gcClient = client;
+        window.gcPlatformClient = platformClient;
+        return;
+      } else {
+        log('?? Stored token expired/invalid. Clearing.');
+        localStorage.removeItem('gc_access_token');
+        localStorage.removeItem('gc_token_expiry');
+        accessToken = null;
+      }
+    }
+
+    // 8) NO TOKEN? RUN THE FLOW. Ensure Admin ? OAuth lists THIS PAGE as an authorized redirect URI, exactly.
+    try {
+      const redirectUri = window.location.origin + window.location.pathname;
+      log(`?? Redirecting to Genesys login with redirectUri=${redirectUri}`);
+      log('?? Confirm Admin ? OAuth has this redirect and the scopes you actually need.');
+
+      await client.loginImplicitGrant(clientId, redirectUri, { state: 'auth' });
+      // SDK will bounce back here with #access_token=... appended.
+    } catch (err) {
+      console.error('? OAuth login failed:', err);
+      if (DEBUG) console.log('?? Check clientId, env, scopes, and that the redirect URI matches exactly (character-for-character).');
+    }
+
+  })();
+  </script>
+</body>
+</html>
