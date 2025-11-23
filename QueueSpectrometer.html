@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QueueSpectrometer – Genesys Cloud CX Real-time Queue Analytics</title>
+  <link rel="stylesheet" href="assets/css/main.css">
+  <style>
+    /* QueueSpectrometer-specific styles scoped to this app */
+    #qspec-app {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: var(--sp-4);
+    }
+
+    #qspec-app h1 {
+      margin-bottom: var(--sp-2);
+    }
+
+    #qspec-app .tagline {
+      color: var(--text-2);
+      margin-bottom: var(--sp-4);
+    }
+
+    /* Status messages using callout pattern */
+    .qspec-status {
+      background: var(--muted-surface);
+      border: 1px solid var(--hairline);
+      border-left-width: 4px;
+      padding: var(--sp-3);
+      border-radius: var(--radius-1);
+      margin: var(--sp-3) 0;
+      font-family: var(--font-mono);
+      font-size: 14px;
+    }
+
+    .qspec-status.info { border-left-color: var(--accent-2); }
+    .qspec-status.error { border-left-color: var(--danger); }
+    .qspec-status.success { border-left-color: var(--success); }
+
+    /* Overall metrics card */
+    #overall {
+      background: var(--surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-1);
+      padding: var(--sp-4);
+      margin: var(--sp-4) 0;
+      box-shadow: var(--shadow-1);
+      display: none;
+    }
+
+    #overall strong {
+      color: var(--accent);
+      font-family: var(--font-head);
+    }
+
+    /* Queue cards */
+    .queue {
+      background: var(--surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-1);
+      padding: var(--sp-4);
+      margin: var(--sp-4) 0;
+      box-shadow: var(--shadow-1);
+    }
+
+    .qhdr {
+      font-weight: 600;
+      font-size: 15px;
+      margin: 0 0 var(--sp-3);
+      padding-bottom: var(--sp-2);
+      border-bottom: 1px solid var(--hairline);
+      color: var(--text-1);
+      font-family: var(--font-head);
+    }
+
+    /* Grid for skill breakdown */
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr auto auto;
+      gap: var(--sp-2) var(--sp-4);
+    }
+
+    .grid div {
+      padding: var(--sp-1) 0;
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .grid .hdr {
+      font-weight: 600;
+      border-bottom: 2px solid var(--hairline);
+      padding-bottom: var(--sp-2);
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      color: var(--text-2);
+    }
+
+    /* Metrics */
+    .metric {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-weight: 500;
+      font-family: var(--font-mono);
+    }
+
+    .waiting { color: var(--warning); }
+    .interacting { color: var(--success); }
+  </style>
+</head>
+<body class="theme-dark">
+  <div id="qspec-app">
+    <h1>🔬 QueueSpectrometer</h1>
+    <p class="tagline">Real-time queue analytics for Genesys Cloud CX</p>
+    <div id="status" class="qspec-status info">Initializing…</div>
+    <div id="overall">
+      <strong>Overall Activity</strong> —
+      Waiting: <span id="ow" class="waiting">0</span> ·
+      Interacting: <span id="oi" class="interacting">0</span>
+    </div>
+    <div id="queues"></div>
+  </div>
+
+  <script>
+  /*
+   * TALKINGSCIENTIST – QueueSpectrometer
+   * Owner: TalkingScientist
+   *
+   * What this is:
+   *   Real-time queue analytics dashboard for Genesys Cloud CX. Monitor queue
+   *   activity, waiting interactions, and skill-based routing breakdowns with
+   *   live WebSocket updates.
+   *
+   * Built on:
+   *   The LAC (Load-Auth-Cache) authentication pattern for browser-based OAuth.
+   *   Learn more: https://www.talkingscientist.com/2025/10/16/gc-lac-starter-load-auth-cache-implicit-browser/
+   *
+   * What you need BEFORE this will work:
+   *   Create an OAuth client in Genesys Cloud (Admin → OAuth):
+   *     Grant Type: Token Implicit Grant (Browser)
+   *     Authorized redirect URIs: EXACT URL of THIS page
+   *     Required Scopes:
+   *       - analytics (for conversation activity queries)
+   *       - routing:readonly (for queue and skill lookups)
+   *       - notifications (for WebSocket subscriptions)
+   *
+   * URL parameters:
+   *   clientId : (required) Your OAuth Client ID
+   *   env      : (required) Genesys Cloud region (e.g., usw2.pure.cloud)
+   *   debug    : (optional) "true" for verbose logging
+   *
+   * Example URL:
+   *   ?clientId=abc123&env=usw2.pure.cloud&debug=true
+   *
+   * Security notes:
+   *   - Implicit Grant is for POCs/simple apps; production should use Auth Code + PKCE
+   *   - Tokens stored in localStorage; serve over HTTPS in production
+   *   - Grant minimal scopes needed; audit regularly
+   */
+
+  (async () => {
+    // DEBUG SWITCH
+    const urlSearchParams = new URLSearchParams(window.location.search);
+    const DEBUG = urlSearchParams.get('debug') === 'true';
+
+    function log(...args) {
+      if (DEBUG) console.log(...args);
+    }
+
+    function setStatus(message, type = 'info') {
+      const el = document.getElementById('status');
+      if (!el) return;
+      el.textContent = message;
+      el.className = 'qspec-status';
+      if (type === 'error') el.className += ' error';
+      if (type === 'success') el.className += ' success';
+      if (type === 'info') el.className += ' info';
+    }
+
+    log('=== QueueSpectrometer boot ===');
+
+    // SDK LOADER (from LAC starter)
+    async function loadSdk() {
+      let platformClient = window.platformClient || window.purecloudPlatformClientV2 ||
+                          (window.purecloud && window.purecloud.platformClient);
+
+      if (platformClient) {
+        log('✓ SDK present (global)');
+        return platformClient;
+      }
+
+      log('⏳ Fetching Genesys Cloud SDK from CDN...');
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://sdk-cdn.mypurecloud.com/javascript/latest/purecloud-platform-client-v2.min.js';
+        script.async = false;
+        script.onload = resolve;
+        script.onerror = (err) => {
+          console.error('✗ SDK script failed to load:', err);
+          reject(err);
+        };
+        document.head.appendChild(script);
+      });
+
+      // AMD path
+      try {
+        if (typeof window.require === 'function') {
+          platformClient = window.require('platformClient');
+          if (platformClient) {
+            log('✓ SDK resolved via AMD/RequireJS');
+            return platformClient;
+          }
+        }
+      } catch {}
+
+      // Poll for SDK
+      for (let i = 0; i < 50; i++) {
+        platformClient = window.platformClient || window.purecloudPlatformClientV2 ||
+                        (window.purecloud && window.purecloud.platformClient);
+        if (platformClient) {
+          log('✓ SDK available (window)');
+          return platformClient;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Heuristic fallback
+      for (const key in window) {
+        try {
+          const obj = window[key];
+          if (obj && typeof obj === 'object' && obj.ApiClient && obj.UsersApi) {
+            log('✓ SDK found (heuristic)');
+            return obj;
+          }
+        } catch {}
+      }
+
+      return null;
+    }
+
+    const platformClient = await loadSdk();
+    if (!platformClient) {
+      setStatus('Could not load Genesys Cloud SDK. Check CDN reachability and CSP.', 'error');
+      return;
+    }
+
+    const client = platformClient.ApiClient.instance;
+
+    // URL MERGE (query + fragment)
+    function getAllUrlParams() {
+      const params = {};
+      const urlParams = new URLSearchParams(window.location.search);
+
+      const hash = window.location.hash && window.location.hash.startsWith('#')
+        ? window.location.hash.substring(1)
+        : '';
+      if (hash) {
+        const hashParams = new URLSearchParams(hash);
+        hashParams.forEach((value, key) => {
+          params[key] = value;
+        });
+      }
+
+      urlParams.forEach((value, key) => {
+        params[key] = value;
+      });
+
+      return params;
+    }
+
+    // TOKEN CHECKER
+    function isTokenValid(token, skipExpiryCheck = false) {
+      if (!token) return false;
+
+      if (skipExpiryCheck) {
+        log('✓ Token accepted (fresh from OAuth redirect)');
+        return true;
+      }
+
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 3) {
+          // Opaque token
+          const storedExpiry = localStorage.getItem('gc_token_expiry');
+          if (storedExpiry) {
+            const expiryTime = parseInt(storedExpiry);
+            const now = Date.now();
+            if (now >= expiryTime) {
+              console.warn(`✗ Token expired at ${new Date(expiryTime).toLocaleString()}`);
+              return false;
+            }
+            const minutesLeft = Math.floor((expiryTime - now) / 60000);
+            log(`✓ Token valid ~${minutesLeft} more minutes (opaque)`);
+            return true;
+          }
+          log('⚠ Non-JWT token without stored expiry – assuming valid (POC mode).');
+          return true;
+        }
+
+        // JWT
+        const payload = JSON.parse(atob(parts[1]));
+        const exp = payload.exp * 1000;
+        const now = Date.now();
+        if (now >= exp) {
+          console.warn(`✗ Token expired at ${new Date(exp).toLocaleString()}`);
+          return false;
+        }
+        const minutesLeft = Math.floor((exp - now) / 60000);
+        log(`✓ Token valid ~${minutesLeft} more minutes (JWT)`);
+        return true;
+      } catch (e) {
+        console.error('✗ Token validation error:', e);
+        return false;
+      }
+    }
+
+    // PERSIST PARAMS
+    function saveParamsToStorage(params) {
+      const savedParams = [];
+      Object.keys(params).forEach(key => {
+        if (key !== 'access_token' && key !== 'expires_in' && key !== 'token_type' && key !== 'state') {
+          localStorage.setItem(`gc_param_${key}`, params[key]);
+          savedParams.push(key);
+        }
+      });
+      if (savedParams.length > 0) {
+        log(`💾 Stored params: ${savedParams.join(', ')}`);
+      }
+    }
+
+    // RESURRECT PARAMS
+    function loadParamsFromStorage() {
+      const params = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key.startsWith('gc_param_')) {
+          const paramName = key.replace('gc_param_', '');
+          params[paramName] = localStorage.getItem(key);
+        }
+      }
+      return params;
+    }
+
+    // 1) SLURP URL PARAMS
+    const urlParams = getAllUrlParams();
+    log('🔍 URL parameters detected:', Object.keys(urlParams));
+
+    // 2) CACHE THEM
+    if (Object.keys(urlParams).length > 0) {
+      saveParamsToStorage(urlParams);
+    }
+
+    // 3) GET clientId + env
+    let clientId = urlParams.clientId || localStorage.getItem('gc_param_clientId');
+    let env = urlParams.env || localStorage.getItem('gc_param_env');
+
+    if (!clientId) {
+      setStatus('Missing clientId. Add ?clientId=YOUR_CLIENT_ID&env=YOUR_ENV to the URL.', 'error');
+      if (DEBUG) console.log('💡 Example: ?clientId=abc123&env=usw2.pure.cloud&debug=true');
+      return;
+    }
+
+    if (!env) {
+      setStatus('Missing env. Add ?env=YOUR_ENV (e.g., usw2.pure.cloud).', 'error');
+      if (DEBUG) console.log('💡 Examples: usw2.pure.cloud | mypurecloud.com | mypurecloud.ie');
+      return;
+    }
+
+    log(`🔧 clientId: ${clientId}`);
+    log(`🌍 environment: ${env}`);
+
+    // 4) APPLY ENVIRONMENT
+    client.setEnvironment(env);
+
+    // 5) OAUTH REDIRECT HANDLING
+    if (urlParams.access_token) {
+      log('🔑 Captured access token from OAuth redirect');
+      localStorage.setItem('gc_access_token', urlParams.access_token);
+
+      if (urlParams.expires_in) {
+        const expiryTime = Date.now() + (parseInt(urlParams.expires_in) * 1000);
+        localStorage.setItem('gc_token_expiry', expiryTime.toString());
+        const minutesValid = Math.floor(parseInt(urlParams.expires_in) / 60);
+        log(`⏱ Token lifetime: ~${minutesValid} minutes`);
+      }
+
+      client.setAccessToken(urlParams.access_token);
+      setStatus('Authentication complete. Loading queue data...', 'success');
+
+      // Clean URL
+      window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+
+      // Start queue monitoring
+      await startQueueMonitoring(platformClient, client);
+      return;
+    }
+
+    // 6) TRY STORED TOKEN
+    let accessToken = localStorage.getItem('gc_access_token');
+
+    // 7) VALIDATE IT
+    if (accessToken) {
+      if (isTokenValid(accessToken)) {
+        log('🔄 Reusing valid token from storage');
+        client.setAccessToken(accessToken);
+        setStatus('Authenticated. Loading queue data...', 'success');
+
+        // Start queue monitoring
+        await startQueueMonitoring(platformClient, client);
+        return;
+      } else {
+        log('⚠ Stored token expired/invalid. Clearing.');
+        localStorage.removeItem('gc_access_token');
+        localStorage.removeItem('gc_token_expiry');
+        accessToken = null;
+      }
+    }
+
+    // 8) NO TOKEN? RUN THE FLOW
+    try {
+      const redirectUri = window.location.origin + window.location.pathname;
+      log(`🔀 Redirecting to Genesys login with redirectUri=${redirectUri}`);
+      setStatus('Redirecting to Genesys Cloud login...');
+
+      await client.loginImplicitGrant(clientId, redirectUri, { state: 'auth' });
+    } catch (err) {
+      console.error('✗ OAuth login failed:', err);
+      setStatus('OAuth login failed. Check console for details.', 'error');
+      if (DEBUG) console.log('💡 Verify clientId, env, and redirect URI match exactly in OAuth client config.');
+    }
+
+    // === QUEUE MONITORING LOGIC ===
+    async function startQueueMonitoring(platformClient, client) {
+      try {
+        const analyticsApi = new platformClient.AnalyticsApi();
+        const notificationsApi = new platformClient.NotificationsApi();
+        const routingApi = new platformClient.RoutingApi();
+
+        // State management
+        const totals = { waiting: 0, interacting: 0 };
+        const byQueue = new Map();
+        let subscribedQueueIds = [];
+        const queueNameCache = new Map();
+        const skillNameCache = new Map();
+
+        log('📊 Initializing analytics subscription...');
+        setStatus('Connecting to Genesys Cloud notifications...');
+
+        // Create WebSocket channel
+        const channel = await notificationsApi.postNotificationsChannels();
+        const ws = new WebSocket(channel.connectUri);
+
+        ws.onmessage = evt => handleMessage(JSON.parse(evt.data));
+        ws.onopen = () => {
+          log('✓ WebSocket connected');
+          setStatus('Connected. Monitoring queues in real-time.', 'success');
+        };
+        ws.onerror = () => {
+          console.error('WebSocket error');
+          setStatus('WebSocket error. Retrying...', 'error');
+        };
+        ws.onclose = () => {
+          console.warn('WebSocket closed');
+          setStatus('Disconnected from queue monitoring.', 'error');
+        };
+
+        // Fetch all queues
+        log('📋 Fetching queue list...');
+        const queueIds = await fetchAllQueueIds(routingApi);
+        subscribedQueueIds = queueIds.slice();
+
+        for (const qid of subscribedQueueIds) ensureQueueState(qid);
+
+        if (!queueIds.length) {
+          setStatus('No queues found. Check user permissions.', 'error');
+          console.warn('No queues available to current user.');
+          return;
+        }
+
+        log(`✓ Found ${queueIds.length} queues`);
+
+        // Build analytics query
+        const body = {
+          order: 'asc',
+          filter: {
+            type: 'and',
+            clauses: [
+              { type: 'or', predicates: queueIds.map(id => ({ dimension: 'queueId', value: id })) },
+              { type: 'or', predicates: [{ dimension: 'mediaType', value: 'voice' }] }
+            ]
+          },
+          groupBy: ['queueId'],
+          peekAtLast: true,
+          metrics: [
+            { metric: 'oWaiting', details: true },
+            { metric: 'oInteracting', details: true }
+          ],
+          subscribe: true
+        };
+
+        const initial = await analyticsApi.postAnalyticsConversationsActivityQuery(body);
+
+        // Subscribe to topics
+        const topics = initial.subscriptions.map(s => ({ id: s.topic }));
+        if (topics.length) {
+          await notificationsApi.putNotificationsChannelSubscriptions(channel.id, topics);
+          log(`✓ Subscribed to ${topics.length} notification topics`);
+        }
+
+        // Process initial snapshot
+        if (initial && Array.isArray(initial.results)) {
+          processResults(initial.results);
+          document.getElementById('overall').style.display = 'block';
+          log(`✓ Initial analytics snapshot: ${initial.results.length} results`);
+        }
+
+        // WebSocket message handler
+        let debugCount = 0;
+        function handleMessage(msg) {
+          if (!msg.topicName?.startsWith("v2.analytics.conversations.activity.queue")) return;
+          if (debugCount < 3) {
+            log('📨 WS message:', msg.topicName);
+            debugCount++;
+          }
+
+          let results = [];
+          if (Array.isArray(msg.eventBody?.results)) {
+            results = msg.eventBody.results;
+          } else if (msg.eventBody && (msg.eventBody.data || msg.eventBody.entities)) {
+            results = [msg.eventBody];
+          }
+
+          if (results.length) {
+            processResults(results);
+          }
+        }
+
+        function ensureQueueState(queueId) {
+          if (!byQueue.has(queueId)) {
+            byQueue.set(queueId, { totals: { waiting: 0, interacting: 0 }, combos: new Map() });
+          }
+          return byQueue.get(queueId);
+        }
+
+        function processResults(results) {
+          totals.waiting = 0;
+          totals.interacting = 0;
+
+          // Reset existing queues
+          for (const q of byQueue.values()) {
+            q.totals.waiting = 0;
+            q.totals.interacting = 0;
+            q.combos.clear();
+          }
+
+          for (const r of results) {
+            const queueId = r.group && r.group.queueId ? r.group.queueId : undefined;
+            const q = queueId ? ensureQueueState(queueId) : null;
+            let hadAggregates = false;
+
+            for (const d of (r.data || [])) {
+              hadAggregates = true;
+              if (d.metric === 'oWaiting') {
+                totals.waiting += d.count || 0;
+                if (q) q.totals.waiting += d.count || 0;
+              }
+              if (d.metric === 'oInteracting') {
+                totals.interacting += d.count || 0;
+                if (q) q.totals.interacting += d.count || 0;
+              }
+            }
+
+            for (const e of (r.entities || [])) {
+              const state = e.metric === 'oWaiting' ? 'waiting'
+                         : e.metric === 'oInteracting' ? 'interacting' : null;
+              if (!state) continue;
+
+              const skills = (e.requestedRoutingSkillIds || []).slice().sort();
+              if (!hadAggregates) {
+                totals[state] += 1;
+                if (q) q.totals[state] += 1;
+              }
+
+              if (q) {
+                const key = skills.join(',') || '(none)';
+                const row = q.combos.get(key) || { waiting: 0, interacting: 0, skillIds: skills };
+                row[state] += 1;
+                q.combos.set(key, row);
+              }
+            }
+          }
+
+          render();
+        }
+
+        // Polling fallback (every 10s)
+        setInterval(async () => {
+          try {
+            const snap = await analyticsApi.postAnalyticsConversationsActivityQuery(body);
+            if (snap && Array.isArray(snap.results)) {
+              processResults(snap.results);
+            }
+          } catch (err) {
+            log('⚠ Polling refresh failed:', err && (err.message || err));
+          }
+        }, 10000);
+
+        async function fetchAllQueueIds(routingApi) {
+          try {
+            const ids = [];
+            let page = 1;
+            const pageSize = 100;
+
+            while (true) {
+              const resp = await routingApi.getRoutingQueues({ pageNumber: page, pageSize, sortOrder: 'asc' });
+              const entities = resp && resp.entities ? resp.entities : [];
+              for (const q of entities) if (q && q.id) ids.push(q.id);
+
+              const nextUri = resp && resp.nextUri;
+              if (!nextUri || entities.length === 0) break;
+              page += 1;
+            }
+
+            return ids;
+          } catch (err) {
+            console.warn('Failed to list queues:', err && (err.message || err));
+            return [];
+          }
+        }
+
+        async function getQueueName(id) {
+          if (queueNameCache.has(id)) return queueNameCache.get(id);
+          try {
+            const q = await routingApi.getRoutingQueue(id);
+            const name = q && q.name ? q.name : id;
+            queueNameCache.set(id, name);
+            return name;
+          } catch (_) {
+            queueNameCache.set(id, id);
+            return id;
+          }
+        }
+
+        async function getSkillNames(ids) {
+          const names = [];
+          for (const id of ids) {
+            if (skillNameCache.has(id)) {
+              names.push(skillNameCache.get(id));
+              continue;
+            }
+            try {
+              const s = await routingApi.getRoutingSkill(id);
+              const nm = s && s.name ? s.name : id;
+              skillNameCache.set(id, nm);
+              names.push(nm);
+            } catch (_) {
+              skillNameCache.set(id, id);
+              names.push(id);
+            }
+          }
+          return names;
+        }
+
+        async function render() {
+          document.getElementById('ow').textContent = totals.waiting;
+          document.getElementById('oi').textContent = totals.interacting;
+
+          const container = document.getElementById('queues');
+          container.textContent = '';
+
+          const ids = subscribedQueueIds.length ? subscribedQueueIds : Array.from(byQueue.keys());
+          for (const queueId of ids) {
+            const q = ensureQueueState(queueId);
+            const wrapper = document.createElement('div');
+            wrapper.className = 'queue';
+
+            const qname = await getQueueName(queueId);
+            const hdr = document.createElement('div');
+            hdr.className = 'qhdr';
+            hdr.innerHTML = `${qname} — <span class="waiting">Waiting: ${q.totals.waiting}</span> · <span class="interacting">Interacting: ${q.totals.interacting}</span>`;
+            wrapper.appendChild(hdr);
+
+            const grid = document.createElement('div');
+            grid.className = 'grid';
+
+            ['Skills', 'Waiting', 'Interacting'].forEach(h => {
+              const d = document.createElement('div');
+              d.className = 'hdr';
+              d.textContent = h;
+              grid.appendChild(d);
+            });
+
+            const entries = Array.from(q.combos.entries());
+            for (const [key, row] of entries) {
+              const skillIds = row.skillIds || [];
+              const skills = await getSkillNames(skillIds);
+              const name = skills.length ? skills.join(', ') : '(No skills required)';
+
+              const skillDiv = document.createElement('div');
+              skillDiv.textContent = name;
+              grid.appendChild(skillDiv);
+
+              const waitDiv = document.createElement('div');
+              waitDiv.className = 'metric waiting';
+              waitDiv.textContent = String(row.waiting);
+              grid.appendChild(waitDiv);
+
+              const intDiv = document.createElement('div');
+              intDiv.className = 'metric interacting';
+              intDiv.textContent = String(row.interacting);
+              grid.appendChild(intDiv);
+            }
+
+            wrapper.appendChild(grid);
+            container.appendChild(wrapper);
+          }
+        }
+
+      } catch (err) {
+        console.error('Queue monitoring error:', err);
+        setStatus('Failed to initialize queue monitoring. Check console.', 'error');
+      }
+    }
+
+  })();
+  </script>
+</body>
+</html>
