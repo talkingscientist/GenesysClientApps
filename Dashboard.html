@@ -1,0 +1,376 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Queue by Skill (Real-time)</title>
+  <style>
+    body { font: 14px/1.35 system-ui, sans-serif; margin: 24px; }
+    .grid { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 18px; max-width: 900px; }
+    .grid div { padding: 6px 0; border-bottom: 1px solid #eee; }
+    .grid .hdr { font-weight: 600; border-bottom: 2px solid #ddd; }
+    .queue { margin: 18px 0 28px; }
+    .qhdr { font-weight: 600; margin: 4px 0 10px; }
+  </style>
+</head>
+<body>
+  <h2>Queue dashboard (real-time, by skill)</h2>
+  <div id="status">Initializing…</div>
+  <div id="auth">
+    <p><strong>Sign in to Genesys Cloud</strong></p>
+    <label for="env">Region</label>
+    <select id="env">
+      <option value="usw2.pure.cloud">US West 2 (usw2.pure.cloud)</option>
+      <option value="use2.pure.cloud">US East 2 (use2.pure.cloud)</option>
+      <option value="cac1.pure.cloud">Canada (cac1.pure.cloud)</option>
+      <option value="euw2.pure.cloud">EU West 2 (euw2.pure.cloud)</option>
+      <option value="apne2.pure.cloud">AP Northeast 2 (apne2.pure.cloud)</option>
+    </select>
+    <label for="clientId" style="margin-left:12px;">Client ID</label>
+    <input id="clientId" placeholder="OAuth Client ID" />
+    <button id="signin">Sign in</button>
+  </div>
+  <p id="overall"><strong>Overall</strong> — Waiting: <span id="ow">0</span> · Interacting: <span id="oi">0</span></p>
+  <div id="queues"></div>
+
+  <script src="https://sdk-cdn.mypurecloud.com/javascript/231.0.0/purecloud-platform-client-v2.min.js"></script>
+  <script>
+  (async () => {
+    if (location.protocol === 'file:' || location.origin === 'null') {
+      const el = document.getElementById('status');
+      if (el) el.textContent = 'CORS blocked: open via http(s) (not file://). See console.';
+      console.error('CORS: Genesys Cloud blocks Origin "null". Serve this file via http(s), e.g., http://localhost:8080');
+      return;
+    }
+    let platformClient =
+      window.platformClient ||
+      window.purecloudPlatformClientV2 ||
+      (window.purecloud && window.purecloud.platformClient);
+    if (!platformClient && typeof window.require === 'function') {
+      try { platformClient = window.require('platformClient'); } catch (_) {}
+    }
+    async function loadSdk(url) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = url;
+        s.async = false;
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+    if (!platformClient) {
+      try {
+        await loadSdk('https://sdk-cdn.mypurecloud.com/javascript/latest/purecloud-platform-client-v2.min.js');
+        platformClient = window.platformClient || window.purecloudPlatformClientV2 || (window.purecloud && window.purecloud.platformClient);
+      } catch (_) {}
+    }
+    if (!platformClient) {
+      // last resort: try to locate an object that looks like the SDK on window
+      for (const key in window) {
+        const v = window[key];
+        if (v && v.ApiClient && v.AnalyticsApi && v.NotificationsApi) { platformClient = v; break; }
+      }
+    }
+    if (!platformClient) {
+      document.getElementById('status').textContent = 'Failed to load Genesys Cloud SDK';
+      return;
+    }
+    const client = platformClient.ApiClient.instance;
+    // UI: implicit grant login
+    const envSel = document.getElementById('env');
+    const cidInp = document.getElementById('clientId');
+    const btn    = document.getElementById('signin');
+    const authBox= document.getElementById('auth');
+    const status = document.getElementById('status');
+
+    // restore last-used values and set environment early
+    try {
+      const savedEnv = localStorage.getItem('gc_env');
+      const savedCid = localStorage.getItem('gc_client_id');
+      if (savedEnv) { envSel.value = savedEnv; client.setEnvironment(savedEnv); }
+      if (savedCid) cidInp.value = savedCid;
+    } catch (_) {}
+
+    // If redirected back with an access token in the URL fragment, capture it
+    try {
+      const hash = window.location.hash && window.location.hash.startsWith('#') ? window.location.hash.substring(1) : '';
+      if (hash && hash.includes('access_token=')) {
+        const params = new URLSearchParams(hash);
+        const token = params.get('access_token');
+        if (token) {
+          client.setAccessToken(token);
+          // clean the URL fragment
+          if (window.history && window.history.replaceState) {
+            window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+          } else {
+            window.location.hash = '';
+          }
+        }
+      }
+    } catch (_) {}
+
+    const startApp = async () => {
+      // nothing here; will be assigned after login
+    };
+
+    btn.addEventListener('click', async () => {
+      const env = envSel.value.trim();
+      const clientId = cidInp.value.trim();
+      if (!env || !clientId) { status.textContent = 'Enter environment and client ID'; return; }
+      try { localStorage.setItem('gc_env', env); localStorage.setItem('gc_client_id', clientId); } catch (_) {}
+      status.textContent = 'Redirecting to login…';
+      client.setEnvironment(env);
+      const redirectUri = window.location.origin + window.location.pathname; // same page
+      await client.loginImplicitGrant(clientId, redirectUri, {});
+      // when redirected back, execution continues after login with token set
+    });
+
+    // If we already have a token (return from redirect), proceed automatically
+    const existingToken = (typeof client.getAccessToken === 'function')
+      ? client.getAccessToken()
+      : (client.authentications && client.authentications['PureCloud OAuth']
+          ? client.authentications['PureCloud OAuth'].accessToken
+          : undefined);
+    if (existingToken) {
+      try {
+        const env = localStorage.getItem('gc_env') || 'usw2.pure.cloud';
+        client.setEnvironment(env);
+      } catch (_) {}
+      authBox.style.display = 'none';
+    } else {
+      // wait for user to sign in
+      if (status) status.textContent = 'Awaiting sign-in…';
+      return;
+    }
+
+    const analyticsApi     = new platformClient.AnalyticsApi();
+    const notificationsApi = new platformClient.NotificationsApi();
+    const routingApi       = new platformClient.RoutingApi();
+
+    // --- state ---
+    const totals = { waiting: 0, interacting: 0 };
+    // queueId -> { totals: {waiting, interacting}, combos: Map(comboKey -> {waiting, interacting, skillIds: string[]}) }
+    const byQueue = new Map();
+    // ordered list of queues we subscribed to (render even if empty)
+    let subscribedQueueIds = [];
+    // caches for id -> name
+    const queueNameCache = new Map();
+    const skillNameCache = new Map();
+
+    // Create Notifications channel (after login)
+    const channel = await notificationsApi.postNotificationsChannels();
+    const ws = new WebSocket(channel.connectUri);
+    ws.onmessage = evt => handleMessage(JSON.parse(evt.data));
+    ws.onopen = () => { const el = document.getElementById('status'); if (el) el.textContent = 'Connected'; };
+    ws.onerror = () => { const el = document.getElementById('status'); if (el) el.textContent = 'WebSocket error'; };
+    ws.onclose = () => { const el = document.getElementById('status'); if (el) el.textContent = 'Disconnected'; };
+
+    // Build activity query
+    const queueIds = await fetchAllQueueIds();
+    subscribedQueueIds = queueIds.slice();
+    // pre-initialize all queues so they render even with zero activity
+    for (const qid of subscribedQueueIds) ensureQueueState(qid);
+    if (!queueIds.length) {
+      console.warn('No queues available to current user.');
+    } else {
+      console.debug(`Subscribing to ${queueIds.length} queues`);
+    }
+
+    const body = {
+      order: 'asc',
+      filter: {
+        type: 'and',
+        clauses: [
+          { type: 'or', predicates: queueIds.map(id => ({ dimension: 'queueId', value: id })) },
+          { type: 'or', predicates: [{ dimension: 'mediaType', value: 'voice' }] }
+        ]
+      },
+      groupBy: ['queueId'],
+      peekAtLast: true,
+      metrics: [
+        { metric: 'oWaiting',     details: true },
+        { metric: 'oInteracting', details: true }
+      ],
+      subscribe: true
+    };
+
+    const initial = await analyticsApi.postAnalyticsConversationsActivityQuery(body);
+
+    // Subscribe channel to the returned topics
+    const topics = initial.subscriptions.map(s => ({ id: s.topic }));
+    if (topics.length) {
+      await notificationsApi.putNotificationsChannelSubscriptions(channel.id, topics);
+    }
+
+    
+
+    // Render initial snapshot from the query response
+    if (initial && Array.isArray(initial.results)) {
+      processResults(initial.results);
+      const el = document.getElementById('status');
+      if (el) el.textContent = 'Subscribed';
+      console.debug('Initial analytics snapshot applied', initial.results.length);
+    }
+
+    let debugCount = 0;
+    function handleMessage(msg) {
+      if (!msg.topicName?.startsWith("v2.analytics.conversations.activity.queue")) return;
+      if (debugCount < 3) { console.debug('WS msg', msg.topicName, Object.keys(msg.eventBody || {})); debugCount++; }
+      let results = [];
+      if (Array.isArray(msg.eventBody?.results)) {
+        results = msg.eventBody.results;
+      } else if (msg.eventBody && (msg.eventBody.data || msg.eventBody.entities)) {
+        results = [msg.eventBody];
+      }
+      if (results.length) {
+        processResults(results);
+      }
+    }
+
+    function ensureQueueState(queueId) {
+      if (!byQueue.has(queueId)) {
+        byQueue.set(queueId, { totals: { waiting: 0, interacting: 0 }, combos: new Map() });
+      }
+      return byQueue.get(queueId);
+    }
+
+    function processResults(results) {
+      totals.waiting = 0;
+      totals.interacting = 0;
+      // reset existing queues, keep them so empty queues still render
+      for (const q of byQueue.values()) {
+        q.totals.waiting = 0;
+        q.totals.interacting = 0;
+        q.combos.clear();
+      }
+      for (const r of results) {
+        const queueId = r.group && r.group.queueId ? r.group.queueId : undefined;
+        const q = queueId ? ensureQueueState(queueId) : null;
+        let hadAggregates = false;
+        for (const d of (r.data || [])) {
+          hadAggregates = true;
+          if (d.metric === 'oWaiting') {
+            totals.waiting += d.count || 0;
+            if (q) q.totals.waiting += d.count || 0;
+          }
+          if (d.metric === 'oInteracting') {
+            totals.interacting += d.count || 0;
+            if (q) q.totals.interacting += d.count || 0;
+          }
+        }
+        for (const e of (r.entities || [])) {
+          const state = e.metric === 'oWaiting' ? 'waiting'
+                     : e.metric === 'oInteracting' ? 'interacting' : null;
+          if (!state) continue;
+          const skills = (e.requestedRoutingSkillIds || []).slice().sort();
+          if (!hadAggregates) {
+            totals[state] += 1;
+            if (q) q.totals[state] += 1;
+          }
+          if (q) {
+            const key = skills.join(',') || '(none)';
+            const row = q.combos.get(key) || { waiting: 0, interacting: 0, skillIds: skills };
+            row[state] += 1;
+            q.combos.set(key, row);
+          }
+        }
+      }
+      render();
+    }
+
+    // Polling fallback to keep the UI fresh in case WS misses diffs
+    setInterval(async () => {
+      try {
+        const snap = await analyticsApi.postAnalyticsConversationsActivityQuery(body);
+        if (snap && Array.isArray(snap.results)) {
+          processResults(snap.results);
+        }
+      } catch (err) {
+        console.debug('Polling refresh failed', err && (err.message || err));
+      }
+    }, 10000);
+
+    async function getQueueName(id) {
+      if (queueNameCache.has(id)) return queueNameCache.get(id);
+      try {
+        const q = await routingApi.getRoutingQueue(id);
+        const name = q && q.name ? q.name : id;
+        queueNameCache.set(id, name);
+        return name;
+      } catch (_) {
+        queueNameCache.set(id, id);
+        return id;
+      }
+    }
+
+    async function fetchAllQueueIds() {
+      try {
+        const ids = [];
+        let page = 1;
+        const pageSize = 100;
+        while (true) {
+          const resp = await routingApi.getRoutingQueues({ pageNumber: page, pageSize, sortOrder: 'asc' });
+          const entities = resp && resp.entities ? resp.entities : [];
+          for (const q of entities) if (q && q.id) ids.push(q.id);
+          const nextUri = resp && resp.nextUri;
+          if (!nextUri || entities.length === 0) break;
+          page += 1;
+        }
+        return ids;
+      } catch (err) {
+        console.warn('Failed to list queues for current user; falling back to none.', err && (err.message || err));
+        return [];
+      }
+    }
+
+    async function getSkillNames(ids) {
+      const names = [];
+      for (const id of ids) {
+        if (skillNameCache.has(id)) { names.push(skillNameCache.get(id)); continue; }
+        try {
+          const s = await routingApi.getRoutingSkill(id);
+          const nm = s && s.name ? s.name : id;
+          skillNameCache.set(id, nm);
+          names.push(nm);
+        } catch (_) {
+          skillNameCache.set(id, id);
+          names.push(id);
+        }
+      }
+      return names;
+    }
+
+    async function render() {
+      document.getElementById('ow').textContent = totals.waiting;
+      document.getElementById('oi').textContent = totals.interacting;
+      const container = document.getElementById('queues');
+      container.textContent = '';
+      const ids = subscribedQueueIds.length ? subscribedQueueIds : Array.from(byQueue.keys());
+      for (const queueId of ids) {
+        const q = ensureQueueState(queueId);
+        const wrapper = document.createElement('div');
+        wrapper.className = 'queue';
+        const qname = await getQueueName(queueId);
+        const hdr = document.createElement('div');
+        hdr.className = 'qhdr';
+        hdr.textContent = `${qname} — Waiting: ${q.totals.waiting} · Interacting: ${q.totals.interacting}`;
+        wrapper.appendChild(hdr);
+
+        const grid = document.createElement('div');
+        grid.className = 'grid';
+        ;['Skills', 'Waiting', 'Interacting'].forEach(h => { const d = document.createElement('div'); d.className = 'hdr'; d.textContent = h; grid.appendChild(d); });
+        const entries = Array.from(q.combos.entries());
+        for (const [key, row] of entries) {
+          const skillIds = row.skillIds || [];
+          const skills = await getSkillNames(skillIds);
+          const name = skills.join(', ');
+          ;[name, String(row.waiting), String(row.interacting)].forEach(txt => { const d = document.createElement('div'); d.textContent = txt; grid.appendChild(d); });
+        }
+        wrapper.appendChild(grid);
+        container.appendChild(wrapper);
+      }
+    }
+  })();
+  </script>
+</body>
+</html>
